@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>B站点歌台 · 大屏</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #fff; overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif; }
+  body.hide-cursor, body.hide-cursor * { cursor: none !important; }
+  video, iframe { position: fixed; inset: 0; width: 100%; height: 100%; border: 0; background: #000; }
+  [hidden] { display: none !important; }
+
+  #idle { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; gap: 6vw;
+    background: radial-gradient(circle at 30% 30%, #3a1d2c, #0d0f14 60%); }
+  #idle h1 { font-size: 6vw; margin: 0 0 1vw; letter-spacing: .2vw; }
+  #idle h1 span { color: #fb7299; }
+  #idle p { font-size: 1.8vw; color: #b7bccb; margin: .6vw 0; }
+  #idle .url { font-size: 2.2vw; color: #23ade5; font-weight: 600; margin-top: 1.5vw; }
+  #idle img { width: 22vw; height: 22vw; background: #fff; border-radius: 1.2vw; padding: 1vw; }
+
+  .panel { position: fixed; background: rgba(10,12,18,.72); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    border-radius: 1vw; padding: 1.2vw 1.6vw; transition: opacity .6s, transform .6s; }
+  .panel.off { opacity: 0; transform: translateY(1vw); pointer-events: none; }
+  #nowCard { left: 2.5vw; bottom: 3vw; max-width: 60vw; }
+  #nowCard .label { color: #fb7299; font-size: 1.1vw; font-weight: 600; }
+  #nowCard .title { font-size: 2.2vw; font-weight: 700; margin: .3vw 0; }
+  #nowCard .sub { font-size: 1.2vw; color: #c4c8d4; }
+  #nowCard .by { color: #23ade5; }
+  #upNext { right: 2.5vw; top: 2.5vw; max-width: 36vw; font-size: 1.3vw; }
+  #upNext b { color: #fb7299; }
+  #corner { right: 1.5vw; bottom: 1.5vw; padding: .6vw; text-align: center; font-size: .9vw; color: #ddd; opacity: .75; }
+  #corner img { width: 7vw; height: 7vw; display: block; background: #fff; border-radius: .4vw; padding: .3vw; margin-bottom: .3vw; }
+  #toast { left: 50%; top: 45%; transform: translate(-50%, -50%); font-size: 2vw; font-weight: 600; }
+  #toast.off { transform: translate(-50%, -40%); }
+
+  #start { position: fixed; inset: 0; z-index: 9; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background: rgba(0,0,0,.82); cursor: pointer; text-align: center; }
+  #start .btn { font-size: 3vw; font-weight: 700; padding: 1.4vw 4vw; border-radius: 5vw; background: #fb7299; }
+  #start p { color: #aaa; font-size: 1.3vw; margin-top: 2vw; line-height: 1.8; }
+</style>
+</head>
+<body>
+<video id="v" playsinline hidden></video>
+<iframe id="frame" allow="autoplay; fullscreen" hidden></iframe>
+
+<div id="idle">
+  <div>
+    <h1><span>B站</span>点歌台</h1>
+    <p>手机连接同一个 Wi-Fi，扫码打开点歌页</p>
+    <p>粘贴 B 站视频链接，就会按顺序在这里播放</p>
+    <div class="url" id="idleUrl"></div>
+  </div>
+  <img src="/api/qr.svg" alt="扫码点歌">
+</div>
+
+<div id="nowCard" class="panel off"></div>
+<div id="upNext" class="panel off"></div>
+<div id="corner" class="panel" hidden><img src="/api/qr.svg" alt="">扫码点歌</div>
+<div id="toast" class="panel off"></div>
+
+<div id="start">
+  <div class="btn">▶ 点击开始</div>
+  <p>浏览器需要点一下才允许自动播放声音<br>点击后会进入全屏 · 快捷键：空格 暂停 / N 切歌 / F 全屏 / ↑↓ 音量</p>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const v = $('#v'), frame = $('#frame');
+
+let state = { now: null, queue: [] };
+let cur = null;            // 当前在播的 item
+let mode = 'video';        // video: 代理直连播放；iframe: B 站内嵌播放器兜底
+let retried = false, resumeAt = 0, iframeStart = 0, iframeTimer = null;
+let unlocked = false, firstPlayerMsg = true, ws = null;
+
+v.volume = parseFloat(localStorage.getItem('tv_volume') ?? '1');
+
+const timers = {};
+function flash(id, html, ms) {
+  const el = $(id);
+  if (html != null) el.innerHTML = html;
+  el.classList.remove('off');
+  clearTimeout(timers[id]);
+  if (ms) timers[id] = setTimeout(() => el.classList.add('off'), ms);
+}
+const hide = id => { clearTimeout(timers[id]); $(id).classList.add('off'); };
+const toast = (msg, ms = 1800) => flash('#toast', esc(msg), ms);
+
+async function post(path, body) {
+  try {
+    await fetch('/api/' + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  } catch (e) { console.warn(e); }
+}
+const next = id => post('next', { id });
+
+function showNowCard(ms = 8000) {
+  if (!cur) return;
+  const left = state.queue.length;
+  flash('#nowCard', `
+    <div class="label">${pausedCard ? '⏸ 已暂停' : '♪ 正在播放'}</div>
+    <div class="title">${esc(cur.title)}${cur.part ? ` · P${cur.page} ${esc(cur.part)}` : ''}</div>
+    <div class="sub">点歌人 <span class="by">${esc(cur.added_by)}</span> · UP ${esc(cur.owner)}${left ? ` · 后面还有 ${left} 首` : ''}</div>`, ms);
+}
+
+function stopAll() {
+  clearTimeout(iframeTimer);
+  pausedCard = false;
+  v.pause(); v.removeAttribute('src'); v.load(); v.hidden = true;
+  frame.src = 'about:blank'; frame.hidden = true;
+  hide('#nowCard'); hide('#upNext');
+}
+
+function play(item) {
+  stopAll();
+  cur = item; mode = 'video'; retried = false; resumeAt = 0;
+  $('#idle').hidden = true; $('#corner').hidden = false;
+  v.hidden = false;
+  v.src = `/api/stream/${item.id}`;
+  if (unlocked) v.play().catch(onPlayBlocked);
+  showNowCard();
+}
+
+function playIframe(item) {
+  stopAll();
+  mode = 'iframe';
+  frame.hidden = false;
+  frame.src = `https://player.bilibili.com/player.html?bvid=${item.bvid}&cid=${item.cid}&p=${item.page}&autoplay=1&danmaku=0&high_quality=1`;
+  iframeStart = Date.now();
+  iframeTimer = setTimeout(() => next(item.id), ((item.duration || 300) + 4) * 1000);
+  toast('直连播放失败，已切换为 B 站内嵌播放器', 4000);
+  showNowCard();
+}
+
+function showIdle() {
+  stopAll();
+  cur = null;
+  $('#idle').hidden = false; $('#corner').hidden = true;
+}
+
+function onState(s) {
+  state = s;
+  if (!s.now) { if (cur || $('#idle').hidden) showIdle(); return; }
+  if (!cur || s.now.id !== cur.id) play(s.now);
+  else cur = s.now;
+}
+
+function onPlayBlocked(err) {
+  if (err && err.name === 'NotAllowedError') { unlocked = false; $('#start').hidden = false; }
+}
+
+v.addEventListener('loadedmetadata', () => { if (resumeAt) { v.currentTime = resumeAt; resumeAt = 0; } });
+v.addEventListener('ended', () => cur && next(cur.id));
+let pausedCard = false;
+v.addEventListener('pause', () => {
+  if (v.paused && !v.ended && v.getAttribute('src')) { pausedCard = true; showNowCard(0); }
+  report();
+});
+v.addEventListener('play', () => {
+  if (pausedCard) { pausedCard = false; showNowCard(4000); }
+  report();
+});
+v.addEventListener('error', () => {
+  if (!cur || mode !== 'video' || !v.getAttribute('src')) return;
+  if (!retried) {
+    retried = true;
+    resumeAt = v.currentTime || 0;
+    v.src = `/api/stream/${cur.id}?retry=${Date.now()}`;
+    if (unlocked) v.play().catch(onPlayBlocked);
+  } else {
+    playIframe(cur);
+  }
+});
+
+function position() {
+  return mode === 'iframe' ? (Date.now() - iframeStart) / 1000 : v.currentTime || 0;
+}
+
+function report() {
+  if (!ws || ws.readyState !== 1 || !cur) return;
+  ws.send(JSON.stringify({
+    type: 'player', id: cur.id, position: position(),
+    duration: (mode === 'video' && isFinite(v.duration) && v.duration) || cur.duration,
+    paused: mode === 'video' ? v.paused : false, volume: v.volume, mode,
+  }));
+}
+
+function updateUpNext() {
+  if (!cur || !state.queue.length) return hide('#upNext');
+  const dur = (isFinite(v.duration) && v.duration) || cur.duration || 0;
+  const remain = dur - position();
+  if (dur && remain <= 20 && remain > 0) {
+    const n = state.queue[0];
+    flash('#upNext', `<b>下一首</b> ${esc(n.title)}<br><span style="color:#aaa">点歌人 ${esc(n.added_by)}</span>`);
+  } else hide('#upNext');
+}
+
+setInterval(() => { report(); updateUpNext(); }, 1000);
+
+function command(c) {
+  if (mode !== 'video') return toast('内嵌播放器模式下请直接切歌');
+  switch (c.action) {
+    case 'toggle': v.paused ? v.play().catch(onPlayBlocked) : v.pause(); break;
+    case 'pause': v.pause(); break;
+    case 'play': v.play().catch(onPlayBlocked); break;
+    case 'restart': v.currentTime = 0; v.play().catch(onPlayBlocked); toast('↺ 从头播放'); break;
+    case 'seek':
+      v.currentTime = Math.max(0, Math.min((v.duration || 0) - 1, v.currentTime + (c.value || 0)));
+      toast(c.value > 0 ? `⏩ 快进 ${c.value} 秒` : `⏪ 后退 ${-c.value} 秒`); break;
+    case 'volume':
+      v.volume = Math.max(0, Math.min(1, Math.round((v.volume + (c.value || 0)) * 10) / 10));
+      localStorage.setItem('tv_volume', v.volume);
+      toast(`🔊 音量 ${Math.round(v.volume * 100)}%`); break;
+  }
+  report();
+}
+
+function connect() {
+  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws?role=tv`);
+  ws.onmessage = e => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'state') onState(msg);
+    else if (msg.type === 'command') command(msg);
+    else if (msg.type === 'player' && firstPlayerMsg) {
+      firstPlayerMsg = false;
+      if (cur && msg.id === cur.id && msg.position > 5 && mode === 'video') {
+        if (v.readyState >= 1) v.currentTime = msg.position; else resumeAt = msg.position;
+      }
+    }
+  };
+  ws.onopen = () => { firstPlayerMsg = true; };
+  ws.onclose = () => setTimeout(connect, 1500);
+}
+
+let wakeLock = null;
+async function keepAwake() {
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (e) {}
+}
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && unlocked) keepAwake(); });
+
+const fullscreen = () => document.fullscreenElement
+  ? document.exitFullscreen()
+  : document.documentElement.requestFullscreen?.().catch(() => {});
+
+$('#start').addEventListener('click', () => {
+  unlocked = true;
+  $('#start').hidden = true;
+  if (!document.fullscreenElement) fullscreen();
+  keepAwake();
+  if (cur && mode === 'video') v.play().catch(onPlayBlocked);
+});
+
+document.addEventListener('keydown', e => {
+  if (e.key === ' ') { e.preventDefault(); command({ action: 'toggle' }); }
+  else if (e.key === 'n' || e.key === 'N') { if (cur) next(cur.id); }
+  else if (e.key === 'f' || e.key === 'F') fullscreen();
+  else if (e.key === 'ArrowUp') command({ action: 'volume', value: 0.1 });
+  else if (e.key === 'ArrowDown') command({ action: 'volume', value: -0.1 });
+  else if (e.key === 'ArrowRight') command({ action: 'seek', value: 10 });
+  else if (e.key === 'ArrowLeft') command({ action: 'seek', value: -10 });
+});
+
+let cursorTimer;
+document.addEventListener('mousemove', () => {
+  document.body.classList.remove('hide-cursor');
+  clearTimeout(cursorTimer);
+  cursorTimer = setTimeout(() => document.body.classList.add('hide-cursor'), 2500);
+});
+
+fetch('/api/info').then(r => r.json()).then(d => { $('#idleUrl').textContent = d.url; }).catch(() => {});
+connect();
+</script>
+</body>
+</html>
